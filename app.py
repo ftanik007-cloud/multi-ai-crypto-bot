@@ -10,9 +10,9 @@ import plotly.graph_objects as go
 import streamlit as st
 from sqlalchemy import create_engine, text
 
-st.set_page_config(page_title="Multi-AI Crypto Bot V1.5 PRO", page_icon="📊", layout="wide")
+st.set_page_config(page_title="Multi-AI Crypto Bot V1.6 PRO", page_icon="📊", layout="wide")
 
-APP_VERSION = "V1.5 PRO"
+APP_VERSION = "V1.6 PRO"
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paper_trades.db")
 
 def get_database_url():
@@ -32,8 +32,8 @@ USING_REMOTE_DB = bool(DATABASE_URL)
 engine = create_engine(DATABASE_URL, pool_pre_ping=True) if USING_REMOTE_DB else create_engine(f"sqlite:///{DB_PATH}", connect_args={"check_same_thread": False})
 BINANCE_BASES = ["https://data-api.binance.vision", "https://api.binance.com"]
 
-st.title("📊 Multi-AI Crypto Market Analysis Bot — V1.5 PRO")
-st.caption("Public market data • Confirmed candles • Paper trading only • Risk guard • Telegram alerts • Reports • Backtest")
+st.title("📊 Multi-AI Crypto Market Analysis Bot — V1.6 PRO")
+st.caption("Multi-coin monitoring • Portfolio exposure guard • Signal analytics • API retry • Paper trading only • Telegram • Reports • Backtest")
 st.warning("শিক্ষামূলক প্রোটোটাইপ। লাভ নিশ্চিত করে না। এখানে কোনো বাস্তব exchange order পাঠানো হয় না।")
 
 # ---------------- Storage: SQLite fallback or persistent PostgreSQL ----------------
@@ -164,7 +164,9 @@ with st.sidebar:
     paper_size = st.number_input("Virtual position size (USDT)", min_value=10.0, max_value=100000.0, value=100.0, step=10.0)
     max_open_trades = st.slider("Maximum open paper trades", 1, 20, 5)
     daily_loss_limit = st.number_input("Daily realized loss limit (USDT)", min_value=0.0, max_value=10000.0, value=20.0, step=5.0, help="0 দিলে দৈনিক loss guard বন্ধ থাকবে।")
-    st.caption("Virtual position size হলো trade-এর notional value; বাস্তব টাকা নয়।")
+    max_open_exposure = st.number_input("Maximum total open exposure (USDT)", min_value=10.0, max_value=1000000.0, value=500.0, step=50.0, help="সব OPEN paper trade-এর virtual position size-এর যোগফল।")
+    monitor_symbols = st.multiselect("Multi-coin monitoring", ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"], default=["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"])
+    st.caption("Virtual position size হলো trade-এর notional value; বাস্তব টাকা নয়। Exposure limit সব খোলা Paper Trade-এ প্রযোজ্য।")
     if USING_REMOTE_DB:
         st.success("Persistent PostgreSQL connected — history cloud database-এ রাখা হচ্ছে।")
     else:
@@ -175,24 +177,27 @@ with st.sidebar:
 def get_klines(pair, timeframe, limit=250):
     last_error = None
     for base in BINANCE_BASES:
-        try:
-            r = requests.get(
-                f"{base}/api/v3/klines",
-                params={"symbol": pair, "interval": timeframe, "limit": limit},
-                timeout=12,
-            )
-            r.raise_for_status()
-            raw = r.json()
-            cols = ["open_time", "open", "high", "low", "close", "volume", "close_time",
-                    "quote_volume", "trades", "taker_buy_base", "taker_buy_quote", "ignore"]
-            frame = pd.DataFrame(raw, columns=cols)
-            for c in ["open", "high", "low", "close", "volume"]:
-                frame[c] = pd.to_numeric(frame[c], errors="coerce")
-            frame["open_time"] = pd.to_datetime(frame["open_time"], unit="ms", utc=True)
-            frame["close_time"] = pd.to_datetime(frame["close_time"], unit="ms", utc=True)
-            return frame.dropna().reset_index(drop=True), None
-        except Exception as e:
-            last_error = str(e)
+        for attempt in range(2):
+            try:
+                r = requests.get(
+                    f"{base}/api/v3/klines",
+                    params={"symbol": pair, "interval": timeframe, "limit": limit},
+                    timeout=12,
+                )
+                r.raise_for_status()
+                raw = r.json()
+                cols = ["open_time", "open", "high", "low", "close", "volume", "close_time",
+                        "quote_volume", "trades", "taker_buy_base", "taker_buy_quote", "ignore"]
+                frame = pd.DataFrame(raw, columns=cols)
+                for c in ["open", "high", "low", "close", "volume"]:
+                    frame[c] = pd.to_numeric(frame[c], errors="coerce")
+                frame["open_time"] = pd.to_datetime(frame["open_time"], unit="ms", utc=True)
+                frame["close_time"] = pd.to_datetime(frame["close_time"], unit="ms", utc=True)
+                return frame.dropna().reset_index(drop=True), None
+            except Exception as e:
+                last_error = f"{base} attempt {attempt + 1}: {e}"
+                if attempt == 0:
+                    time.sleep(0.4)
     return None, last_error or "Unknown market data error"
 
 
@@ -345,7 +350,35 @@ elif side == "SELL":
 else:
     entry = sl = tp1 = tp2 = None
 
+# ---------------- V1.6 multi-coin market monitor ----------------
+monitor_rows = []
+for monitor_symbol in monitor_symbols:
+    try:
+        monitor_raw, monitor_error = get_klines(monitor_symbol, interval, 250)
+        if monitor_raw is None or len(monitor_raw) < 80:
+            monitor_rows.append({"Coin": monitor_symbol, "Timeframe": interval, "Trend": "DATA ERROR", "Last Close": None, "RSI": None, "ATR %": None, "Last Closed Candle (UTC)": "—", "Status": (monitor_error or "Insufficient data")[:100]})
+            continue
+        monitor_closed = monitor_raw.iloc[:-1].copy()
+        monitor_calc = indicators(monitor_closed).dropna().reset_index(drop=True)
+        if monitor_calc.empty:
+            monitor_rows.append({"Coin": monitor_symbol, "Timeframe": interval, "Trend": "NO DATA", "Last Close": None, "RSI": None, "ATR %": None, "Last Closed Candle (UTC)": "—", "Status": "Indicator data insufficient"})
+            continue
+        mr = monitor_calc.iloc[-1]
+        mclose = float(mr["close"]); mrsi = float(mr["rsi"]); matr = float(mr["atr"]); me9 = float(mr["ema9"]); me21 = float(mr["ema21"]); me50 = float(mr["ema50"])
+        trend = "BULLISH" if mclose > me9 > me21 > me50 else ("BEARISH" if mclose < me9 < me21 < me50 else "MIXED")
+        monitor_rows.append({"Coin": monitor_symbol, "Timeframe": interval, "Trend": trend, "Last Close": mclose, "RSI": round(mrsi, 1), "ATR %": round(matr / mclose * 100, 3) if mclose else None, "Last Closed Candle (UTC)": str(mr["close_time"]), "Status": "Trend snapshot only — not a confirmed trade signal"})
+    except Exception as monitor_exc:
+        monitor_rows.append({"Coin": monitor_symbol, "Timeframe": interval, "Trend": "ERROR", "Last Close": None, "RSI": None, "ATR %": None, "Last Closed Candle (UTC)": "—", "Status": str(monitor_exc)[:100]})
+
 # ---------------- UI ----------------
+st.subheader("🌐 Multi-Coin Monitor")
+st.caption("শুধু সম্পূর্ণ বন্ধ candle-এর ডেটা। Trend snapshot নিজে BUY/SELL confirmation নয় এবং এই monitor একা কোনো trade খোলে না।")
+if monitor_rows:
+    monitor_df = pd.DataFrame(monitor_rows)
+    st.dataframe(monitor_df, use_container_width=True, hide_index=True)
+else:
+    st.info("Monitoring-এর জন্য sidebar থেকে অন্তত একটি coin বেছে নাও।")
+
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("Last closed price", f"{price:,.4f}")
 m2.metric("RSI (14)", f"{float(last['rsi']):.1f}")
@@ -565,10 +598,13 @@ closed_today_pnl = sum(
     and str(t.get("exit_time") or t.get("created_at", ""))[:10] == today_utc
 )
 open_before_signal = sum(1 for t in trades_before_signal if t.get("status") == "OPEN")
+open_exposure = sum(float(t.get("virtual_size_usdt") or 0) for t in trades_before_signal if t.get("status") == "OPEN")
 risk_guard_reason = None
 if open_before_signal >= max_open_trades:
     risk_guard_reason = f"Maximum open paper trades reached ({max_open_trades})."
-if daily_loss_limit > 0 and closed_today_pnl <= -daily_loss_limit:
+elif open_exposure + float(paper_size) > max_open_exposure:
+    risk_guard_reason = f"Portfolio exposure cap would be exceeded: {open_exposure:.2f} + {paper_size:.2f} > {max_open_exposure:.2f} USDT."
+elif daily_loss_limit > 0 and closed_today_pnl <= -daily_loss_limit:
     risk_guard_reason = f"Daily realized loss limit reached ({daily_loss_limit:.2f} USDT)."
 
 if confirmed and side in ("BUY", "SELL"):
@@ -584,7 +620,7 @@ if confirmed and side in ("BUY", "SELL"):
             "virtual_size_usdt": float(paper_size), "created_at": now_utc.isoformat()
         })
         if inserted:
-            alert_text = (f"📊 Multi-AI Crypto Bot V1.5 PRO\nPaper signal: {side} {symbol}\n"
+            alert_text = (f"📊 Multi-AI Crypto Bot V1.6 PRO\nPaper signal: {side} {symbol}\n"
                           f"Timeframe: {interval}\nEntry: {float(entry):.8g}\nSL: {float(sl):.8g}\n"
                           f"TP1: {float(tp1):.8g}\nTP2: {float(tp2):.8g}\n"
                           "Paper trade only — no real order sent.")
@@ -637,6 +673,28 @@ if trades_list:
 
     show_cols = ["id", "signal_time", "symbol", "interval", "side", "entry", "sl", "tp1", "tp2", "virtual_size_usdt", "tp1_hit", "status", "realized_pnl_usdt", "tp1_time", "exit_time"]
     st.dataframe(trades[show_cols], use_container_width=True, hide_index=True)
+
+    st.subheader("🧠 Signal Quality Analytics — by Coin & Timeframe")
+    closed_analytics = trades[trades["status"].astype(str).str.startswith("CLOSED")].copy()
+    if not closed_analytics.empty:
+        closed_analytics["realized_pnl_usdt"] = pd.to_numeric(closed_analytics["realized_pnl_usdt"], errors="coerce")
+        closed_analytics = closed_analytics.dropna(subset=["realized_pnl_usdt"])
+        if not closed_analytics.empty:
+            def group_metrics(group):
+                vals = group["realized_pnl_usdt"]
+                gp = float(vals[vals > 0].sum()); gl = abs(float(vals[vals < 0].sum()))
+                return pd.Series({"Closed Trades": len(vals), "Win Rate %": round(float((vals > 0).sum() / len(vals) * 100), 1), "Profit Factor": round(gp / gl, 2) if gl > 0 else (float("inf") if gp > 0 else 0.0), "Total P&L (USDT)": round(float(vals.sum()), 4)})
+            quality_rows = []
+            for (coin_name, timeframe_name), group in closed_analytics.groupby(["symbol", "interval"], dropna=False):
+                metrics = group_metrics(group)
+                quality_rows.append({"Coin": coin_name, "Timeframe": timeframe_name, **metrics.to_dict()})
+            quality = pd.DataFrame(quality_rows)
+            st.dataframe(quality, use_container_width=True, hide_index=True)
+            st.caption("কম ট্রেড থাকলে এই পরিসংখ্যান অনিশ্চিত; অতীতের ফল ভবিষ্যৎ লাভের নিশ্চয়তা নয়।")
+        else:
+            st.info("Analytics-এর জন্য valid closed-trade P&L পাওয়া যায়নি।")
+    else:
+        st.info("Coin/timeframe analytics দেখাতে closed paper trade প্রয়োজন।")
     if curve:
         st.subheader("Closed-trade equity curve")
         curve_df = pd.DataFrame(curve)
@@ -775,7 +833,7 @@ if run_backtest:
                 st.download_button("Download Backtest CSV",data=btdf.to_csv(index=False).encode("utf-8-sig"),file_name="multi_ai_crypto_backtest.csv",mime="text/csv")
                 st.warning("Backtest approximation: MTF confirmation is not used as a mandatory gate; entry at candle close is simulated; fees/spread/slippage are excluded; OHLC candles cannot reveal exact intrabar order. Historical results do not predict future returns.")
 
-st.caption(f"Last refresh: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
+st.caption(f"Version: {APP_VERSION} • Last refresh: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
 st.caption("Market data: Binance public spot klines. Data may be delayed or unavailable. Permanent storage requires DATABASE_URL; SQLite fallback is not guaranteed to survive redeploy.")
 # Streamlit rerun-based refresh; hosting may sleep or throttle.
 time.sleep(0.2)
